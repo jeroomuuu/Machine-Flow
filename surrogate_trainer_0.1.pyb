@@ -1,3 +1,12 @@
+# =============================================================================
+# FORENSIC SCANNER v1.6 — STRONG Conv1D SURROGATE (960M particles)
+# Paperspace setup with proper installs
+# =============================================================================
+
+# === INSTALL COMMANDS (run these in terminal if needed) ===
+# sudo apt-get update && sudo apt-get install -y python3-dev build-essential
+# pip install "numpy<2" pymc==5.16.1 arviz scikit-learn pandas pyarrow torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,12 +16,13 @@ import matplotlib.pyplot as plt
 import pymc as pm
 import arviz as az
 from sklearn.model_selection import train_test_split
+import torch.optim.lr_scheduler as lr_scheduler
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"🚀 Using device: {device}")
 
-# ========================== LOAD + FIX SHAPE ==========================
-print("Loading matrices...")
+# ========================== 1. LOAD + ALIGN SHAPES ==========================
+print("Loading 960M-particle matrices...")
 micro_basis  = np.load("Matrix_A_Micro_Basis.npy")
 micro_labels = np.load("Matrix_A_Micro_Labels.npy")
 macro_basis  = np.load("Matrix_A_Macro_Basis.npy")
@@ -21,7 +31,7 @@ macro_labels = np.load("Matrix_A_Macro_Labels.npy")
 print(f"Micro shape: {micro_basis.shape}")
 print(f"Macro shape: {macro_basis.shape}")
 
-# Align dimensions by padding
+# Align dimensions (padding the smaller one)
 max_cols = max(micro_basis.shape[1], macro_basis.shape[1])
 if micro_basis.shape[1] < max_cols:
     micro_basis = np.pad(micro_basis, ((0,0),(0, max_cols - micro_basis.shape[1])), mode='constant')
@@ -31,38 +41,58 @@ else:
 basis = np.vstack([micro_basis, macro_basis])
 labels = np.concatenate([micro_labels, macro_labels])
 
-print(f"Final basis shape: {basis.shape} | {len(labels)} materials")
+print(f"✅ Final combined basis: {basis.shape[0]} materials × {basis.shape[1]} bins")
 
-# ========================== PYTORCH SURROGATE ==========================
+# ========================== 2. STRONG 1D CONV SURROGATE ==========================
 class ScannerSurrogate(nn.Module):
     def __init__(self, input_dim, hidden=1024):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden),
+        # 1D Conv backbone - treats spectrum as a signal
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 128, kernel_size=7, padding=3),
             nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.Conv1d(128, 256, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(128 * input_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.15),
             nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden, hidden//2),
+            nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
-            nn.Linear(hidden//2, input_dim)
+            nn.Linear(hidden // 2, input_dim)
         )
-    def forward(self, x):
-        return self.net(x)
     
+    def forward(self, x):
+        x = x.unsqueeze(1)                    # (batch, 1, seq_len)
+        x = self.conv(x)
+        x = self.fc(x)
+        return x
+
+# Data preparation
 X = torch.tensor(basis, dtype=torch.float32).to(device)
 
-train_idx, val_idx = train_test_split(np.arange(len(X)), test_size=0.2, random_state=42)
-train_loader = DataLoader(TensorDataset(X[train_idx], X[train_idx]), batch_size=512, shuffle=True)
-val_loader   = DataLoader(TensorDataset(X[val_idx],   X[val_idx]),   batch_size=512, shuffle=False)
+train_idx, val_idx = train_test_split(np.arange(len(X)), test_size=0.18, random_state=42)
+
+train_loader = DataLoader(TensorDataset(X[train_idx], X[train_idx]), 
+                         batch_size=1024, shuffle=True, num_workers=0)
+val_loader   = DataLoader(TensorDataset(X[val_idx], X[val_idx]), 
+                         batch_size=1024, shuffle=False, num_workers=0)
 
 model = ScannerSurrogate(input_dim=basis.shape[1], hidden=1024).to(device)
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-5)
+scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=30, verbose=True)
 criterion = nn.MSELoss()
 
-print("\nTraining surrogate on 960M-particle data...")
-for epoch in range(400):
+print("\nTraining strong Conv1D surrogate on 960M-particle data (4x scaled)...")
+best_val = float('inf')
+for epoch in range(500):
     model.train()
     train_loss = 0.0
     for bx, target in train_loader:
@@ -72,42 +102,46 @@ for epoch in range(400):
         optimizer.step()
         train_loss += loss.item()
     
-    if (epoch + 1) % 50 == 0 or epoch == 399:
-        model.eval()
-        val_loss = sum(criterion(model(bx), target).item() for bx, target in val_loader)
-        print(f"Epoch {epoch+1:3d} | Train MSE: {train_loss/len(train_loader):.2e} | Val MSE: {val_loss/len(val_loader):.2e}")
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for bx, target in val_loader:
+            val_loss += criterion(model(bx), target).item()
+    val_loss /= len(val_loader)
+    
+    scheduler.step(val_loss)
+    
+    if (epoch + 1) % 50 == 0 or epoch == 499:
+        print(f"Epoch {epoch+1:3d} | Train MSE: {train_loss/len(train_loader):.2e} | Val MSE: {val_loss:.2e}")
 
-torch.save(model.state_dict(), "surrogate_960M_v2.pth")
-print("✅ Surrogate saved!")
+torch.save(model.state_dict(), "surrogate_960M_conv_v4.pth")
+print("✅ Strong Conv1D surrogate saved as surrogate_960M_conv_v4.pth")
 
-# ========================== VALIDATION PLOTS ==========================
+# ========================== 3. VALIDATION PLOTS ==========================
 model.eval()
 with torch.no_grad():
     recon = model(X[:8]).cpu().numpy()
 
-plt.figure(figsize=(15, 18))
-for i in range(6):
-    plt.subplot(3, 2, i+1)
+plt.figure(figsize=(16, 12))
+for i in range(8):
+    plt.subplot(4, 2, i+1)
     plt.semilogy(basis[i], label="True OpenMC (960M)", alpha=0.85)
-    plt.semilogy(recon[i], label="Surrogate", alpha=0.85)
+    plt.semilogy(recon[i], label="Conv Surrogate v4", alpha=0.85)
     plt.title(labels[i])
     plt.legend()
 plt.tight_layout()
-plt.suptitle("Surrogate vs True High-Fidelity Spectra")
+plt.suptitle("Improved Conv1D Surrogate vs True High-Fidelity Spectra")
 plt.show()
 
-# ========================== PyMC BAYESIAN ==========================
+# ========================== 4. FIXED PyMC BAYESIAN ==========================
 def run_pymc_surrogate(observed_spectrum, n_samples=1000):
-    """Fixed version - safer PyMC + Surrogate inference"""
-    print("\n🔬 Running PyMC + Surrogate Bayesian inference...")
-    
+    print("\n🔬 Running PyMC + Conv Surrogate Bayesian inference...")
     model_sur = ScannerSurrogate(basis.shape[1]).to(device)
-    model_sur.load_state_dict(torch.load("surrogate_960M.pth", map_location=device))
+    model_sur.load_state_dict(torch.load("surrogate_960M_conv_v4.pth", map_location=device))
     model_sur.eval()
 
     def surrogate_forward(p):
-        # Convert proportions to tensor safely
-        p_np = np.array(p, dtype=np.float32)
+        p_np = np.asarray(p, dtype=np.float32).flatten()
         p_t = torch.tensor(p_np, dtype=torch.float32, device=device).unsqueeze(0)
         with torch.no_grad():
             pred = model_sur(p_t)
@@ -116,26 +150,24 @@ def run_pymc_surrogate(observed_spectrum, n_samples=1000):
     with pm.Model() as m:
         proportions = pm.Dirichlet("proportions", a=np.ones(len(labels)))
         predicted = pm.Deterministic("predicted", surrogate_forward(proportions))
-        
         sigma = pm.HalfNormal("sigma", sigma=0.05)
         pm.Normal("observed", mu=predicted, sigma=sigma, observed=observed_spectrum)
-        
-        trace = pm.sample(n_samples, tune=400, target_accept=0.95, chains=2, progressbar=True, return_inferencedata=True)
+        trace = pm.sample(n_samples, tune=300, target_accept=0.95, chains=2, progressbar=True, return_inferencedata=True)
     
     summary = az.summary(trace, var_names=["proportions"], hdi_prob=0.95)
-    
     print("\n🎯 BAYESIAN COMPOSITION")
-    print("="*60)
+    print("="*70)
     for i, label in enumerate(labels):
         m = summary.loc[f"proportions[{i}]", "mean"] * 100
         lo = summary.loc[f"proportions[{i}]", "hdi_2.5%"] * 100
         hi = summary.loc[f"proportions[{i}]", "hdi_97.5%"] * 100
         if m > 0.5:
-            print(f"{label:25} {m:6.1f}%  [{lo:5.1f}–{hi:5.1f}]%")
-    
-    return trace, summary            
+            print(f"{label:25} {m:6.1f}%  [{lo:5.1f} – {hi:5.1f}]%")
+    return trace, summary
+
 # Quick test
 dummy_obs = np.random.rand(basis.shape[1]) * 0.01
 run_pymc_surrogate(dummy_obs, n_samples=800)
 
-print("\n🎉 All done! Replace dummy_obs with real scan data when ready.")
+print("\n🎉 Training + Bayesian pipeline complete!")
+print("Next step: Replace dummy_obs with real spectrum from scan.py")
